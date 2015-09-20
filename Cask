@@ -1,4 +1,4 @@
-(source melpa)
+(source melpa-stable)
 (source gnu)
 
 (package-file "clj-refactor.el")
