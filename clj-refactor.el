@@ -6,9 +6,9 @@
 ;; Author: Magnar Sveen <magnars@gmail.com>
 ;;         Lars Andersen <expez@expez.com>
 ;;         Benedek Fazekas <benedek.fazekas@gmail.com>
-;; Version: 1.2.0-SNAPSHOT
+;; Version: 1.2.0
 ;; Keywords: convenience, clojure, cider
-;; Package-Requires: ((emacs "24.4") (s "1.8.0") (dash "2.4.0") (yasnippet "0.6.1") (paredit "24") (multiple-cursors "1.2.2") (cider "0.10.0-cvs") (edn "1.1.2") (inflections "2.3") (hydra "0.13.2"))
+;; Package-Requires: ((emacs "24.4") (s "1.8.0") (dash "2.4.0") (yasnippet "0.6.1") (paredit "24") (multiple-cursors "1.2.2") (cider "0.9.1") (edn "1.1.2") (inflections "2.3") (hydra "0.13.2"))
 
 ;; This program is free software; you can redistribute it and/or
 ;; modify it under the terms of the GNU General Public License
@@ -254,6 +254,7 @@ namespace in the project."
 (defvar cljr--change-signature-buffer "*cljr-change-signature*")
 (defvar cljr--manual-intervention-buffer "*cljr-manual-intervention*")
 (defvar cljr--find-symbol-buffer "*cljr-find-usages*")
+(defvar cljr--namespace-aliases-cache nil)
 
 ;;; Buffer Local Declarations
 
@@ -854,7 +855,7 @@ See: https://github.com/clojure-emacs/clj-refactor.el/wiki/cljr-rename-file-or-d
 
 (defun cljr--op-supported? (op)
   "Is the OP we require provided by the current middleware stack?"
-  (cider-nrepl-op-supported-p op))
+  (nrepl-op-supported-p op))
 
 (defun cljr--assert-middleware ()
   (unless (featurep 'cider)
@@ -866,11 +867,9 @@ See: https://github.com/clojure-emacs/clj-refactor.el/wiki/cljr-rename-file-or-d
 
 (defun cljr--ensure-op-supported (op)
   "Check for support of middleware op OP.
-
-Signal an error if it is not supported, otherwise return OP."
+Signal an error if it is not supported."
   (cljr--assert-middleware)
-  (if (cljr--op-supported? op)
-      op
+  (unless (cljr--op-supported? op)
     (user-error "Can't find nREPL middleware providing op \"%s\".  Please, install (or update) refactor-nrepl %s and restart the REPL."
                 op (upcase (cljr--version :prune-package-version)))))
 
@@ -2304,19 +2303,6 @@ FEATURE is either :clj or :cljs."
 (defun cljr--aget (map key)
   (cdr (assoc key map)))
 
-(defun cljr--call-middleware-for-namespace-aliases ()
-  (-> "namespace-aliases"
-      cljr--ensure-op-supported
-      cljr--create-msg
-      (cljr--call-middleware-sync "namespace-aliases")
-      edn-read))
-
-(defun cljr--get-aliases-from-middleware ()
-  (-when-let (aliases (cljr--call-middleware-for-namespace-aliases))
-    (if (cljr--clj-context?)
-        (gethash :clj aliases)
-      (gethash :cljs aliases))))
-
 (defun cljr--magic-requires-lookup-alias ()
   "Return (alias (ns.candidate1 ns.candidate1)) if we recognize
 the alias in the project."
@@ -2324,15 +2310,18 @@ the alias in the project."
                 (cljr--point-after 'paredit-backward)
                 (1- (point)))))
     (unless (cljr--resolve-alias short)
-      (-if-let* ((aliases (with-demoted-errors (cljr--get-aliases-from-middleware)))
-                 (candidates (gethash (intern short) aliases)))
-          (list short candidates)
-        (when (and cljr-magic-require-namespaces ; a regex against "" always triggers
-                   (s-matches? (cljr--magic-requires-re) short))
+      (if (and cljr-magic-require-namespaces ; a regex against "" always triggers
+               (s-matches? (cljr--magic-requires-re) short))
           ;; This when-let might seem unnecessary but the regexp match
           ;; isn't perfect.
           (-when-let (long (cljr--aget cljr-magic-require-namespaces short))
-            (list short (list long))))))))
+            (list short (list long)))
+        (-when-let (aliases (and cljr--namespace-aliases-cache
+                                 (if (cljr--clj-context?)
+                                     (gethash :clj cljr--namespace-aliases-cache)
+                                   (gethash :cljs cljr--namespace-aliases-cache))))
+          (-when-let (candidates (gethash (intern short) aliases))
+            (list short candidates)))))))
 
 ;;;###autoload
 (defun cljr-slash ()
@@ -2509,13 +2498,13 @@ See: https://github.com/clojure-emacs/clj-refactor.el/wiki/cljr-sort-project-dep
   "Call the middleware with REQUEST.
 
 If it's present KEY indicates the key to extract from the response."
-  (let ((response (-> request cider-nrepl-send-sync-request cljr--maybe-rethrow-error)))
+  (let ((response (-> request nrepl-send-sync-request cljr--maybe-rethrow-error)))
     (if key
         (nrepl-dict-get response key)
       response)))
 
 (defun cljr--call-middleware-async (request &optional callback)
-  (cider-nrepl-send-request request callback))
+  (nrepl-send-request request callback))
 
 (defun cljr--get-artifacts-from-middleware (force)
   (message "Retrieving list of available libraries...")
@@ -2992,6 +2981,16 @@ See: https://github.com/clojure-emacs/clj-refactor.el/wiki/cljr-rename-symbol"
     (paredit-forward)
     (cljr--just-one-blank-line)))
 
+(defun cljr--update-namespace-aliases-cache-async ()
+  "Update the contents of `cljr--namespace-aliases-cache'."
+  (cljr--call-middleware-async
+   (cljr--create-msg "namespace-aliases")
+   (lambda (response)
+     (ignore-errors
+       (cljr--maybe-rethrow-error response) ; abort; best effort
+       (setq cljr--namespace-aliases-cache
+             (edn-read (nrepl-dict-get response "namespace-aliases")))))))
+
 ;;;###autoload
 (defun cljr-clean-ns ()
   "Clean the ns form for the current buffer.
@@ -3113,7 +3112,7 @@ Date. -> Date
   (cljr--call-middleware-sync
    (cljr--create-msg "resolve-missing"
                      "symbol" (cljr--symbol-suffix symbol)
-                     "session" (cider-current-session))
+                     "session" (nrepl-current-session))
    "candidates"))
 
 (defun cljr--get-error-value (response)
@@ -3146,7 +3145,7 @@ itself might be `nil'."
 
 (defun cljr--maybe-eval-ns-form ()
   (when cljr-auto-eval-ns-form
-    (cider-eval-ns-form :synchronously)))
+    (cider-eval-ns-form)))
 
 ;;;###autoload
 (defun cljr-add-missing-libspec ()
@@ -3267,9 +3266,8 @@ See: https://github.com/clojure-emacs/clj-refactor.el/wiki/cljr-extract-function
       (insert body ")"))
     (insert "(")
     (when name (insert name))
-    (unless (s-blank? unbound)
-      (save-excursion
-        (insert " " unbound ")")))
+    (save-excursion
+      (insert " " unbound ")"))
     (unless name
       (mc/maybe-multiple-cursors-mode))))
 
@@ -3514,7 +3512,8 @@ You can mute this warning by changing cljr-suppress-middleware-warnings."
     (when cljr-populate-artifact-cache-on-startup
       (cljr--update-artifact-cache))
     (when cljr-eagerly-build-asts-on-startup
-      (cljr--warm-ast-cache))))
+      (cljr--warm-ast-cache))
+    (cljr--update-namespace-aliases-cache-async)))
 
 (defvar cljr--list-fold-function-names
   '("map" "mapv" "pmap" "keep" "mapcat" "filter" "remove" "take-while" "drop-while"
